@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "claudes"
+version = "0.1.0"
+description = "Run many Claude Code instances in parallel"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+
+[project.scripts]
+claudes = "claudes:main"
