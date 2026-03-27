@@ -179,11 +179,21 @@ def cmd_skill(args):
     sys.stderr = sys.__stderr__
 
 
+def resolve_worktree_base(args):
+    """Return worktree_base, defaulting to current branch if not specified."""
+    if args.worktree_base:
+        return args.worktree_base
+    return subprocess.check_output(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+    ).strip()
+
+
 def cmd_merge(args):
     """Iteratively rebase and merge each worker branch into the current branch."""
-    branches = get_worker_branches(args.worktree_base)
+    worktree_base = resolve_worktree_base(args)
+    branches = get_worker_branches(worktree_base)
     if not branches:
-        print(f"No worker branches found matching '{args.worktree_base}-*'", file=sys.stderr)
+        print(f"No worker branches found matching '{worktree_base}-*'", file=sys.stderr)
         sys.exit(1)
 
     current_branch = subprocess.check_output(
@@ -219,9 +229,10 @@ def cmd_merge(args):
 
 def cmd_clean(args):
     """Remove all worker branches and worktrees."""
-    branches = get_worker_branches(args.worktree_base)
+    worktree_base = resolve_worktree_base(args)
+    branches = get_worker_branches(worktree_base)
     if not branches:
-        print(f"No worker branches found matching '{args.worktree_base}-*'")
+        print(f"No worker branches found matching '{worktree_base}-*'")
         return
 
     # Get list of worktrees
@@ -240,7 +251,7 @@ def cmd_clean(args):
                 worktree_paths[branch] = current_path
             current_path = None
 
-    print(f"Cleaning {len(branches)} worker branches for '{args.worktree_base}'")
+    print(f"Cleaning {len(branches)} worker branches for '{worktree_base}'")
 
     for branch in branches:
         # Remove worktree if it exists
@@ -303,8 +314,9 @@ def main():
     )
     merge_parser.add_argument(
         "worktree_base",
-        type=str,
-        help="Worktree base name (branches named <base>-0, <base>-1, ... will be merged)",
+        nargs="?",
+        default="",
+        help="Worktree base name (default: current branch). Branches named <base>-0, <base>-1, ... will be merged.",
     )
 
     # clean subcommand
@@ -314,8 +326,9 @@ def main():
     )
     clean_parser.add_argument(
         "worktree_base",
-        type=str,
-        help="Worktree base name (branches named <base>-0, <base>-1, ... will be removed)",
+        nargs="?",
+        default="",
+        help="Worktree base name (default: current branch). Branches named <base>-0, <base>-1, ... will be removed.",
     )
 
     args = parser.parse_args()
