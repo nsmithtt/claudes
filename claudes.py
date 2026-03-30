@@ -45,7 +45,11 @@ class TeeStream:
 
 
 def run_invocation(
-    skill: str, skill_args: str, worktree_branch: str | None, log_file: Path
+    skill: str,
+    skill_args: str,
+    worktree_branch: str | None,
+    log_file: Path,
+    model: str | None = None,
 ):
     """Run claude on a single skill invocation."""
     prompt = f"/{skill} {skill_args}".strip()
@@ -56,6 +60,8 @@ def run_invocation(
         "--allowedTools",
         "Edit,Write,Read,Glob,Grep,Bash,Skill,Agent",
     ]
+    if model is not None:
+        cmd.extend(["--model", model])
     if worktree_branch is not None:
         cmd.extend(["--worktree", worktree_branch])
 
@@ -83,6 +89,7 @@ def run_worker(
     skill: str,
     worktree_base: str | None,
     result_queue: multiprocessing.Queue,
+    model: str | None = None,
 ):
     """Run all assigned invocations sequentially in this worker."""
     worktree_branch = (
@@ -91,7 +98,9 @@ def run_worker(
     for skill_args in invocations:
         safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
         log_file = LOG_DIR / f"{safe_name}.log"
-        _, rc, reason = run_invocation(skill, skill_args, worktree_branch, log_file)
+        _, rc, reason = run_invocation(
+            skill, skill_args, worktree_branch, log_file, model
+        )
         result_queue.put((worker_index, skill_args, rc, reason))
 
 
@@ -159,7 +168,13 @@ def cmd_skill(args):
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [
             executor.submit(
-                run_worker, idx, chunk, args.skill_name, worktree_base, result_queue
+                run_worker,
+                idx,
+                chunk,
+                args.skill_name,
+                worktree_base,
+                result_queue,
+                args.model,
             )
             for idx, chunk in enumerate(chunks)
         ]
@@ -321,6 +336,12 @@ def main():
         const="",
         default=None,
         help="Run in a git worktree. Optional branch name (default: current branch). Worker id is appended.",
+    )
+    skill_parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Claude model to use (e.g. sonnet, opus, claude-sonnet-4-6)",
     )
     skill_parser.add_argument(
         "skill_name",
