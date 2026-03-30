@@ -44,7 +44,9 @@ class TeeStream:
         self._file.flush()
 
 
-def run_invocation(skill: str, skill_args: str, worktree_branch: str | None, log_file: Path):
+def run_invocation(
+    skill: str, skill_args: str, worktree_branch: str | None, log_file: Path
+):
     """Run claude on a single skill invocation."""
     prompt = f"/{skill} {skill_args}".strip()
     cmd = [
@@ -83,7 +85,9 @@ def run_worker(
     result_queue: multiprocessing.Queue,
 ):
     """Run all assigned invocations sequentially in this worker."""
-    worktree_branch = f"{worktree_base}-{worker_index}" if worktree_base is not None else None
+    worktree_branch = (
+        f"{worktree_base}-{worker_index}" if worktree_base is not None else None
+    )
     for skill_args in invocations:
         safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
         log_file = LOG_DIR / f"{safe_name}.log"
@@ -95,7 +99,8 @@ def get_worker_branches(worktree_base: str) -> list[str]:
     """Find all worker branches matching the base pattern."""
     result = subprocess.run(
         ["git", "branch", "--list", f"{worktree_base}-*"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     branches = []
     for line in result.stdout.strip().splitlines():
@@ -103,7 +108,9 @@ def get_worker_branches(worktree_base: str) -> list[str]:
         if branch:
             branches.append(branch)
     # Sort numerically by worker index suffix
-    branches.sort(key=lambda b: int(b.rsplit("-", 1)[-1]) if b.rsplit("-", 1)[-1].isdigit() else 0)
+    branches.sort(
+        key=lambda b: int(b.rsplit("-", 1)[-1]) if b.rsplit("-", 1)[-1].isdigit() else 0
+    )
     return branches
 
 
@@ -114,18 +121,16 @@ def cmd_skill(args):
         if args.worktree:
             worktree_base = args.worktree
         else:
-            worktree_base = (
-                subprocess.check_output(
-                    ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
-                ).strip()
-            )
+            worktree_base = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
+            ).strip()
 
     lines = [line.strip() for line in sys.stdin if line.strip()]
 
     if args.start > 0:
-        lines = lines[args.start:]
+        lines = lines[args.start :]
     if args.limit > 0:
-        lines = lines[:args.limit]
+        lines = lines[: args.limit]
 
     if not lines:
         print("No input lines to process.", file=sys.stderr)
@@ -202,21 +207,32 @@ def cmd_merge(args):
     print(f"Merging {len(branches)} worker branches into {current_branch}")
 
     for branch in branches:
-        print(f"\n--- Rebasing {branch} onto {current_branch} ---")
+        subprocess.run(["git", "checkout", branch], capture_output=True)
+        print(f"\n--- Rebasing {branch} onto {current_branch} (strategy: theirs) ---")
         result = subprocess.run(
-            ["git", "rebase", current_branch, branch],
-            capture_output=True, text=True,
+            [
+                "git",
+                "rebase",
+                "--keep-empty",
+                "--allow-empty-message",
+                "-X",
+                "theirs",
+                current_branch,
+            ],
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
             print(f"Rebase failed for {branch}:\n{result.stderr}", file=sys.stderr)
             subprocess.run(["git", "rebase", "--abort"])
             sys.exit(1)
 
-        print(f"--- Merging {branch} into {current_branch} (strategy: theirs) ---")
+        print(f"--- Merging {branch} into {current_branch} ---")
         subprocess.run(["git", "checkout", current_branch], capture_output=True)
         result = subprocess.run(
-            ["git", "merge", "-X", "theirs", branch, "-m", f"Merge {branch}"],
-            capture_output=True, text=True,
+            ["git", "merge", branch],
+            capture_output=True,
+            text=True,
         )
         if result.returncode != 0:
             print(f"Merge failed for {branch}:\n{result.stderr}", file=sys.stderr)
@@ -238,15 +254,16 @@ def cmd_clean(args):
     # Get list of worktrees
     worktree_result = subprocess.run(
         ["git", "worktree", "list", "--porcelain"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     worktree_paths = {}
     current_path = None
     for line in worktree_result.stdout.splitlines():
         if line.startswith("worktree "):
-            current_path = line[len("worktree "):]
+            current_path = line[len("worktree ") :]
         elif line.startswith("branch refs/heads/"):
-            branch = line[len("branch refs/heads/"):]
+            branch = line[len("branch refs/heads/") :]
             if current_path:
                 worktree_paths[branch] = current_path
             current_path = None
@@ -259,14 +276,16 @@ def cmd_clean(args):
             print(f"Removing worktree for {branch} at {worktree_paths[branch]}")
             subprocess.run(
                 ["git", "worktree", "remove", "--force", worktree_paths[branch]],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
 
         # Delete the branch
         print(f"Deleting branch {branch}")
         subprocess.run(
             ["git", "branch", "-D", branch],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
 
     # Prune worktree metadata
@@ -281,7 +300,9 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # skill subcommand
-    skill_parser = subparsers.add_parser("skill", help="Run parallel Claude skill invocations")
+    skill_parser = subparsers.add_parser(
+        "skill", help="Run parallel Claude skill invocations"
+    )
     skill_parser.add_argument(
         "--start",
         type=int,
