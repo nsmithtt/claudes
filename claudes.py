@@ -64,6 +64,7 @@ def run_invocation(
         cmd.extend(["--model", model])
     if worktree_branch is not None:
         cmd.extend(["--worktree", worktree_branch])
+        cmd.extend(["--add-dir", Path.cwd()])
 
     with open(log_file, "w") as log:
         result = subprocess.run(
