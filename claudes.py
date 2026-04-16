@@ -27,19 +27,29 @@ from pathlib import Path
 CLAUDES_DIR = Path.cwd() / ".claudes"
 LOG_DIR = CLAUDES_DIR / "logs"
 
-SETTINGS = {
-    "sandbox": {
-        "enabled": True,
-        "failIfUnavailable": True,
-        "autoAllowBashIfSandboxed": True,
-        "allowUnsandboxedCommands": False,
-        "filesystem": {
-            "allowRead": ["./"],
-            "allowWrite": ["./"],
-            "denyWrite": ["/"],
+def build_settings(worktree_branch: str | None) -> dict:
+    allow = ["."]
+    if worktree_branch is not None:
+        worktree_dir = worktree_branch.replace("/", "+")
+        allow.append(str(Path.cwd() / ".claude" / "worktrees" / worktree_dir))
+    return {
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "autoAllowBashIfSandboxed": True,
+            "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "allowRead": allow,
+                "allowWrite": allow,
+                "denyWrite": ["/"],
+            },
+            "network": {
+                "allowedDomains": [
+                    "*",
+                ],
+            },
         },
-    },
-}
+    }
 
 
 class TeeStream:
@@ -64,18 +74,20 @@ def build_claude_command(
     skill_args: str,
     worktree_branch: str | None,
     model: str | None,
+    headless=True,
 ):
     """Build the claude CLI command for a single skill invocation."""
     prompt = f"/{skill} {skill_args}".strip()
     cmd = [
         "claude",
-        "-p",
         prompt,
         "--settings",
-        json.dumps(SETTINGS),
+        json.dumps(build_settings(worktree_branch)),
         "--allowedTools",
         "Edit,Write,Read,Glob,Grep,Bash,Skill,Agent",
     ]
+    if headless:
+        cmd.append("-p")
     if model is not None:
         cmd.extend(["--model", model])
     if worktree_branch is not None:
@@ -180,7 +192,7 @@ def cmd_skill(args):
             f"{worktree_base}-debug" if worktree_base is not None else None
         )
         cmd = build_claude_command(
-            args.skill_name, skill_args, worktree_branch, args.model
+            args.skill_name, skill_args, worktree_branch, args.model, headless=False,
         )
         print("Debug mode: running 1 invocation inline")
         print(f"Skill: /{args.skill_name} {skill_args}")
