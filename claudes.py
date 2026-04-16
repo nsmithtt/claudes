@@ -117,12 +117,13 @@ def build_bwrap_command(
     # The workspace's `.git` is a pointer file to the real gitdir. Resolve it
     # so we bind the actual directory: `<repo>/.git` for a main-repo worktree,
     # `<superproject>/.git/modules/<sub>` for a submodule worktree.
-    main_git = Path(
+    git_dir = Path(
         subprocess.check_output(
             ["git", "-C", str(workspace_path), "rev-parse", "--git-common-dir"],
             text=True,
         ).strip()
     ).resolve()
+    main_git = Path.cwd()
 
     cmd = [
         "bwrap",
@@ -135,18 +136,21 @@ def build_bwrap_command(
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
+        # Read-only view of the whole home, then punch rw holes for the
+        # paths Claude and git actually need to write.
+        "--ro-bind", str(home), str(home),
     ]
 
     for path in extra_ro_binds:
         cmd += ["--ro-bind", path, path]
+    for path in extra_rw_binds:
+        cmd += ["--bind", path, path]
 
     cmd += [
-        # Read-only view of the whole home, then punch rw holes for the
-        # paths Claude and git actually need to write.
-        "--ro-bind", str(home), str(home),
         "--bind", str(home / ".claude"), str(home / ".claude"),
         "--bind", str(home / ".claude.json"), str(home / ".claude.json"),
-        "--bind", str(main_git), str(main_git),
+        "--ro-bind", str(main_git), str(main_git),
+        "--bind", str(git_dir), str(git_dir),
         "--bind", str(workspace_path), str(workspace_path),
         "--chdir", str(workspace_path),
         "--unshare-ipc",
@@ -154,9 +158,6 @@ def build_bwrap_command(
         "--unshare-uts",
         "--die-with-parent",
     ]
-
-    for path in extra_rw_binds:
-        cmd += ["--bind", path, path]
 
     # Pass the ssh-agent socket through if one is available on the host.
     ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
