@@ -136,9 +136,8 @@ def build_bwrap_command(
         "--proc", "/proc",
         "--dev", "/dev",
         "--tmpfs", "/tmp",
-        # Read-only view of the whole home, then punch rw holes for the
-        # paths Claude and git actually need to write.
-        "--ro-bind", str(home), str(home),
+        # Bind all of home which is kind of unsafe, but claude barfs on ~/.claude.json if this is read-only.
+        "--bind", str(home), str(home),
     ]
 
     for path in extra_ro_binds:
@@ -147,8 +146,6 @@ def build_bwrap_command(
         cmd += ["--bind", path, path]
 
     cmd += [
-        "--bind", str(home / ".claude"), str(home / ".claude"),
-        "--bind", str(home / ".claude.json"), str(home / ".claude.json"),
         "--ro-bind", str(main_git), str(main_git),
         "--bind", str(git_dir), str(git_dir),
         "--bind", str(workspace_path), str(workspace_path),
