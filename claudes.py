@@ -17,6 +17,7 @@ Example:
 
 import argparse
 import datetime
+import json
 import multiprocessing
 import subprocess
 import sys
@@ -25,6 +26,20 @@ from pathlib import Path
 
 CLAUDES_DIR = Path.cwd() / ".claudes"
 LOG_DIR = CLAUDES_DIR / "logs"
+
+SETTINGS = {
+    "sandbox": {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "autoAllowBashIfSandboxed": True,
+        "allowUnsandboxedCommands": False,
+        "filesystem": {
+            "allowRead": ["./"],
+            "allowWrite": ["./"],
+            "denyWrite": ["/"],
+        },
+    },
+}
 
 
 class TeeStream:
@@ -57,6 +72,8 @@ def run_invocation(
         "claude",
         "-p",
         prompt,
+        "--settings",
+        json.dumps(SETTINGS),
         "--allowedTools",
         "Edit,Write,Read,Glob,Grep,Bash,Skill,Agent",
     ]
