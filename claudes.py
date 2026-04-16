@@ -59,14 +59,13 @@ class TeeStream:
         self._file.flush()
 
 
-def run_invocation(
+def build_claude_command(
     skill: str,
     skill_args: str,
     worktree_branch: str | None,
-    log_file: Path,
-    model: str | None = None,
+    model: str | None,
 ):
-    """Run claude on a single skill invocation."""
+    """Build the claude CLI command for a single skill invocation."""
     prompt = f"/{skill} {skill_args}".strip()
     cmd = [
         "claude",
@@ -81,7 +80,19 @@ def run_invocation(
         cmd.extend(["--model", model])
     if worktree_branch is not None:
         cmd.extend(["--worktree", worktree_branch])
-        cmd.extend(["--add-dir", Path.cwd()])
+        cmd.extend(["--add-dir", str(Path.cwd())])
+    return cmd
+
+
+def run_invocation(
+    skill: str,
+    skill_args: str,
+    worktree_branch: str | None,
+    log_file: Path,
+    model: str | None = None,
+):
+    """Run claude on a single skill invocation."""
+    cmd = build_claude_command(skill, skill_args, worktree_branch, model)
 
     with open(log_file, "w") as log:
         result = subprocess.run(
@@ -162,6 +173,20 @@ def cmd_skill(args):
     if not lines:
         print("No input lines to process.", file=sys.stderr)
         sys.exit(1)
+
+    if args.debug:
+        skill_args = lines[0]
+        worktree_branch = (
+            f"{worktree_base}-debug" if worktree_base is not None else None
+        )
+        cmd = build_claude_command(
+            args.skill_name, skill_args, worktree_branch, args.model
+        )
+        print("Debug mode: running 1 invocation inline")
+        print(f"Skill: /{args.skill_name} {skill_args}")
+        print(f"Command: {' '.join(cmd)}")
+        result = subprocess.run(cmd)
+        sys.exit(result.returncode)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -360,6 +385,11 @@ def main():
         type=str,
         default=None,
         help="Claude model to use (e.g. sonnet, opus, claude-sonnet-4-6)",
+    )
+    skill_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: take 1 input, run claude directly in this process (no worker pool)",
     )
     skill_parser.add_argument(
         "skill_name",
