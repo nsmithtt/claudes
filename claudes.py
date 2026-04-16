@@ -17,8 +17,9 @@ Example:
 
 import argparse
 import datetime
-import json
 import multiprocessing
+import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -27,29 +28,145 @@ from pathlib import Path
 CLAUDES_DIR = Path.cwd() / ".claudes"
 LOG_DIR = CLAUDES_DIR / "logs"
 
-def build_settings(worktree_branch: str | None) -> dict:
-    allow = ["."]
-    if worktree_branch is not None:
-        worktree_dir = worktree_branch.replace("/", "+")
-        allow.append(str(Path.cwd() / ".claude" / "worktrees" / worktree_dir))
-    return {
-        "sandbox": {
-            "enabled": True,
-            "failIfUnavailable": True,
-            "autoAllowBashIfSandboxed": True,
-            "allowUnsandboxedCommands": False,
-            "filesystem": {
-                "allowRead": allow,
-                "allowWrite": allow,
-                "denyWrite": ["/"],
-            },
-            "network": {
-                "allowedDomains": [
-                    "*",
-                ],
-            },
-        },
-    }
+
+def list_worktrees() -> dict[str, Path]:
+    """Return {branch_name: worktree_path} for every worktree in this repo."""
+    result = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    worktrees: dict[str, Path] = {}
+    current_path: str | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree ") :]
+        elif line.startswith("branch refs/heads/"):
+            branch = line[len("branch refs/heads/") :]
+            if current_path:
+                worktrees[branch] = Path(current_path)
+            current_path = None
+    return worktrees
+
+
+def ensure_worktree(branch: str) -> Path:
+    """Create or reuse a worktree for `branch` at the conventional path.
+
+    Raises if the branch is checked out at a different path, or if the target
+    path is occupied by a different branch.
+    """
+    path = Path.cwd() / "worktrees" / branch.replace("/", "+")
+    existing = list_worktrees()
+
+    if branch in existing:
+        if existing[branch].resolve() == path.resolve():
+            return path
+        raise RuntimeError(
+            f"Branch '{branch}' is already checked out at {existing[branch]}, "
+            f"expected {path}"
+        )
+    for b, p in existing.items():
+        if p.resolve() == path.resolve():
+            raise RuntimeError(
+                f"Worktree path {path} is occupied by branch '{b}', not '{branch}'"
+            )
+
+    branch_exists = (
+        subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        ).returncode
+        == 0
+    )
+
+    # Drop stale worktree registrations so a half-cleaned prior run doesn't
+    # collide with `git worktree add` below.
+    subprocess.run(["git", "worktree", "prune"], check=True)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    add_cmd = ["git", "worktree", "add"]
+    if branch_exists:
+        add_cmd += [str(path), branch]
+    else:
+        add_cmd += ["-b", branch, str(path)]
+    subprocess.run(add_cmd, check=True)
+
+    # `git worktree add` doesn't materialize submodule worktree gitdirs, so
+    # the `.git` pointer files inside each submodule end up dangling. Running
+    # `submodule update` inside the new worktree creates those gitdirs.
+    subprocess.run(
+        ["git", "-C", str(path), "submodule", "update", "--init", "--recursive"],
+        check=True,
+    )
+    return path
+
+
+def build_bwrap_command(
+    workspace_path: Path,
+    extra_ro_binds: list[str],
+    extra_rw_binds: list[str],
+) -> list[str]:
+    """Bubblewrap prefix that restricts Claude to `workspace_path` plus the
+    minimum host paths needed for Claude itself and git to function.
+
+    `extra_ro_binds` / `extra_rw_binds` are host paths the caller wants
+    exposed beyond the defaults. They are applied last so they can override
+    the base binds on overlapping paths.
+    """
+    home = Path.home()
+    # The workspace's `.git` is a pointer file to the real gitdir. Resolve it
+    # so we bind the actual directory: `<repo>/.git` for a main-repo worktree,
+    # `<superproject>/.git/modules/<sub>` for a submodule worktree.
+    main_git = Path(
+        subprocess.check_output(
+            ["git", "-C", str(workspace_path), "rev-parse", "--git-common-dir"],
+            text=True,
+        ).strip()
+    ).resolve()
+
+    cmd = [
+        "bwrap",
+        "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/etc", "/etc",
+        "--symlink", "usr/bin", "/bin",
+        "--symlink", "usr/lib", "/lib",
+        "--symlink", "usr/lib64", "/lib64",
+        "--symlink", "usr/sbin", "/sbin",
+        "--proc", "/proc",
+        "--dev", "/dev",
+        "--tmpfs", "/tmp",
+    ]
+
+    for path in extra_ro_binds:
+        cmd += ["--ro-bind", path, path]
+
+    cmd += [
+        # Read-only view of the whole home, then punch rw holes for the
+        # paths Claude and git actually need to write.
+        "--ro-bind", str(home), str(home),
+        "--bind", str(home / ".claude"), str(home / ".claude"),
+        "--bind", str(home / ".claude.json"), str(home / ".claude.json"),
+        "--bind", str(main_git), str(main_git),
+        "--bind", str(workspace_path), str(workspace_path),
+        "--chdir", str(workspace_path),
+        "--unshare-ipc",
+        "--unshare-pid",
+        "--unshare-uts",
+        "--die-with-parent",
+    ]
+
+    for path in extra_rw_binds:
+        cmd += ["--bind", path, path]
+
+    # Pass the ssh-agent socket through if one is available on the host.
+    ssh_auth_sock = os.environ.get("SSH_AUTH_SOCK")
+    if ssh_auth_sock and Path(ssh_auth_sock).exists():
+        cmd += [
+            "--ro-bind-try", ssh_auth_sock, ssh_auth_sock,
+            "--setenv", "SSH_AUTH_SOCK", ssh_auth_sock,
+        ]
+    cmd.append("--")
+    return cmd
 
 
 class TeeStream:
@@ -72,7 +189,6 @@ class TeeStream:
 def build_claude_command(
     skill: str,
     skill_args: str,
-    worktree_branch: str | None,
     model: str | None,
     headless=True,
 ):
@@ -81,8 +197,6 @@ def build_claude_command(
     cmd = [
         "claude",
         prompt,
-        "--settings",
-        json.dumps(build_settings(worktree_branch)),
         "--allowedTools",
         "Edit,Write,Read,Glob,Grep,Bash,Skill,Agent",
     ]
@@ -90,27 +204,62 @@ def build_claude_command(
         cmd.append("-p")
     if model is not None:
         cmd.extend(["--model", model])
-    if worktree_branch is not None:
-        cmd.extend(["--worktree", worktree_branch])
-        cmd.extend(["--add-dir", str(Path.cwd())])
     return cmd
+
+
+def build_sandboxed_command(
+    skill: str,
+    skill_args: str,
+    worktree_path: Path | None,
+    model: str | None,
+    extra_ro_binds: list[str],
+    extra_rw_binds: list[str],
+    sandbox: bool = False,
+    headless: bool = True,
+) -> list[str]:
+    """Claude argv, optionally wrapped in bwrap when `sandbox` is True."""
+    cmd = build_claude_command(skill, skill_args, model, headless)
+    if not sandbox:
+        return cmd
+
+    workspace = worktree_path if worktree_path is not None else Path.cwd()
+
+    # The `claude` launcher on PATH is often a symlink (sometimes chained
+    # through a $HOME symlink like ~/.local -> /proj_sw/...) into a versioned
+    # install tree. Bind the fully-resolved real binary and invoke it directly
+    # so the sandbox doesn't have to reproduce the host's symlink topology.
+    extra_ro = list(extra_ro_binds)
+    claude_on_path = shutil.which("claude")
+    if claude_on_path:
+        claude_real = str(Path(claude_on_path).resolve())
+        cmd[0] = claude_real
+        extra_ro.append(claude_real)
+
+    return build_bwrap_command(workspace, extra_ro, extra_rw_binds) + cmd
 
 
 def run_invocation(
     skill: str,
     skill_args: str,
-    worktree_branch: str | None,
+    worktree_path: Path | None,
     log_file: Path,
-    model: str | None = None,
+    model: str | None,
+    extra_ro_binds: list[str],
+    extra_rw_binds: list[str],
+    sandbox: bool,
 ):
     """Run claude on a single skill invocation."""
-    cmd = build_claude_command(skill, skill_args, worktree_branch, model)
+    cmd = build_sandboxed_command(
+        skill, skill_args, worktree_path, model, extra_ro_binds, extra_rw_binds,
+        sandbox=sandbox,
+    )
 
     with open(log_file, "w") as log:
         result = subprocess.run(
             cmd,
             stdout=log,
             stderr=subprocess.STDOUT,
+            cwd=str(worktree_path) if worktree_path is not None else None,
         )
 
     reason = ""
@@ -130,17 +279,22 @@ def run_worker(
     skill: str,
     worktree_base: str | None,
     result_queue: multiprocessing.Queue,
-    model: str | None = None,
+    model: str | None,
+    extra_ro_binds: list[str],
+    extra_rw_binds: list[str],
+    sandbox: bool,
 ):
     """Run all assigned invocations sequentially in this worker."""
-    worktree_branch = (
-        f"{worktree_base}-{worker_index}" if worktree_base is not None else None
-    )
+    worktree_path: Path | None = None
+    if worktree_base is not None:
+        worktree_path = ensure_worktree(f"{worktree_base}-{worker_index}")
+
     for skill_args in invocations:
         safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
         log_file = LOG_DIR / f"{safe_name}.log"
         _, rc, reason = run_invocation(
-            skill, skill_args, worktree_branch, log_file, model
+            skill, skill_args, worktree_path, log_file, model,
+            extra_ro_binds, extra_rw_binds, sandbox,
         )
         result_queue.put((worker_index, skill_args, rc, reason))
 
@@ -188,16 +342,20 @@ def cmd_skill(args):
 
     if args.debug:
         skill_args = lines[0]
-        worktree_branch = (
-            f"{worktree_base}-debug" if worktree_base is not None else None
-        )
-        cmd = build_claude_command(
-            args.skill_name, skill_args, worktree_branch, args.model, headless=False,
+        worktree_path: Path | None = None
+        if worktree_base is not None:
+            worktree_path = ensure_worktree(f"{worktree_base}-debug")
+        cmd = build_sandboxed_command(
+            args.skill_name, skill_args, worktree_path, args.model,
+            args.ro_bind, args.rw_bind, sandbox=args.sandbox, headless=False,
         )
         print("Debug mode: running 1 invocation inline")
         print(f"Skill: /{args.skill_name} {skill_args}")
         print(f"Command: {' '.join(cmd)}")
-        result = subprocess.run(cmd)
+        result = subprocess.run(
+            cmd,
+            cwd=str(worktree_path) if worktree_path is not None else None,
+        )
         sys.exit(result.returncode)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -230,6 +388,9 @@ def cmd_skill(args):
                 worktree_base,
                 result_queue,
                 args.model,
+                args.ro_bind,
+                args.rw_bind,
+                args.sandbox,
             )
             for idx, chunk in enumerate(chunks)
         ]
@@ -321,31 +482,15 @@ def cmd_clean(args):
         print(f"No worker branches found matching '{worktree_base}-*'")
         return
 
-    # Get list of worktrees
-    worktree_result = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-    )
-    worktree_paths = {}
-    current_path = None
-    for line in worktree_result.stdout.splitlines():
-        if line.startswith("worktree "):
-            current_path = line[len("worktree ") :]
-        elif line.startswith("branch refs/heads/"):
-            branch = line[len("branch refs/heads/") :]
-            if current_path:
-                worktree_paths[branch] = current_path
-            current_path = None
+    worktree_paths = list_worktrees()
 
     print(f"Cleaning {len(branches)} worker branches for '{worktree_base}'")
 
     for branch in branches:
-        # Remove worktree if it exists
         if branch in worktree_paths:
             print(f"Removing worktree for {branch} at {worktree_paths[branch]}")
             subprocess.run(
-                ["git", "worktree", "remove", "--force", worktree_paths[branch]],
+                ["git", "worktree", "remove", "--force", str(worktree_paths[branch])],
                 capture_output=True,
                 text=True,
             )
@@ -358,8 +503,15 @@ def cmd_clean(args):
             text=True,
         )
 
-    # Prune worktree metadata
+    # Prune worktree metadata in the main repo and every submodule — the
+    # parent `git worktree remove` above doesn't recurse, so submodule
+    # worktree gitdirs under .git/modules/*/worktrees/<branch> are orphaned
+    # until pruned.
     subprocess.run(["git", "worktree", "prune"], capture_output=True)
+    subprocess.run(
+        ["git", "submodule", "foreach", "--recursive", "git worktree prune"],
+        capture_output=True,
+    )
     print("Done.")
 
 
@@ -402,6 +554,25 @@ def main():
         "--debug",
         action="store_true",
         help="Debug mode: take 1 input, run claude directly in this process (no worker pool)",
+    )
+    skill_parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="Run claude inside a bwrap sandbox restricted to the worktree (or cwd) plus essential host paths",
+    )
+    skill_parser.add_argument(
+        "--ro-bind",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Additional host path to expose read-only inside the sandbox (may repeat, requires --sandbox)",
+    )
+    skill_parser.add_argument(
+        "--rw-bind",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Additional host path to expose writable inside the sandbox (may repeat, requires --sandbox)",
     )
     skill_parser.add_argument(
         "skill_name",
