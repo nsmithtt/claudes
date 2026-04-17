@@ -19,11 +19,17 @@ import argparse
 import datetime
 import multiprocessing
 import os
+import random
 import shutil
 import subprocess
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
+
+RATE_LIMIT_MAX_RETRIES = 5
+RATE_LIMIT_BASE_DELAY = 30.0
+RATE_LIMIT_MAX_DELAY = 300.0
 
 CLAUDES_DIR = Path.cwd() / ".claudes"
 LOG_DIR = CLAUDES_DIR / "logs"
@@ -236,6 +242,20 @@ def build_sandboxed_command(
     return build_bwrap_command(workspace, extra_ro, extra_rw_binds) + cmd
 
 
+def _log_tail(log_file: Path, n_chars: int = 4000) -> str:
+    try:
+        return log_file.read_text()[-n_chars:]
+    except OSError:
+        return ""
+
+
+def _is_rate_limited(log_tail: str) -> bool:
+    # Matches `API Error: Request rejected (429) · ... rate limit ...` from the
+    # claude CLI. We require both markers so a stray "429" in model output
+    # doesn't trigger spurious retries.
+    return "(429)" in log_tail and "rate limit" in log_tail.lower()
+
+
 def run_invocation(
     skill: str,
     skill_args: str,
@@ -246,29 +266,43 @@ def run_invocation(
     extra_rw_binds: list[str],
     sandbox: bool,
 ):
-    """Run claude on a single skill invocation."""
+    """Run claude on a single skill invocation, retrying on 429 rate limits."""
     cmd = build_sandboxed_command(
         skill, skill_args, worktree_path, model, extra_ro_binds, extra_rw_binds,
         sandbox=sandbox,
     )
 
-    with open(log_file, "w") as log:
-        result = subprocess.run(
-            cmd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            cwd=str(worktree_path) if worktree_path is not None else None,
-        )
+    attempt = 0
+    while True:
+        mode = "w" if attempt == 0 else "a"
+        with open(log_file, mode) as log:
+            if attempt > 0:
+                log.write(f"\n--- retry attempt {attempt} after 429 ---\n")
+                log.flush()
+            result = subprocess.run(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=str(worktree_path) if worktree_path is not None else None,
+            )
 
-    reason = ""
-    if result.returncode != 0:
-        try:
-            last_line = log_file.read_text().strip().rsplit("\n", 1)[-1]
-            reason = last_line[:200]
-        except OSError:
-            reason = "could not read log"
+        if result.returncode == 0:
+            return skill_args, 0, ""
 
-    return skill_args, result.returncode, reason
+        tail = _log_tail(log_file)
+        if _is_rate_limited(tail) and attempt < RATE_LIMIT_MAX_RETRIES:
+            # Exponential backoff with jitter. Jitter spreads simultaneously-
+            # throttled workers so they don't re-collide on the same minute
+            # window when the limit resets.
+            delay = min(
+                RATE_LIMIT_BASE_DELAY * (2 ** attempt), RATE_LIMIT_MAX_DELAY
+            ) + random.uniform(0, 15)
+            time.sleep(delay)
+            attempt += 1
+            continue
+
+        last_line = tail.strip().rsplit("\n", 1)[-1] if tail.strip() else "could not read log"
+        return skill_args, result.returncode, last_line[:200]
 
 
 def run_worker(
