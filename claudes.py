@@ -331,6 +331,33 @@ def _is_rate_limited(log_tail: str) -> bool:
     return "(429)" in log_tail and "rate limit" in log_tail.lower()
 
 
+def run_generator(cmd: str, inflight: list[str]) -> list[str]:
+    """Invoke the generator shell command, piping the current in-flight
+    skill_args on stdin. Return non-empty output lines."""
+    stdin_payload = "\n".join(inflight)
+    if stdin_payload:
+        stdin_payload += "\n"
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            input=stdin_payload,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("[claudes] generator command timed out\n")
+        return []
+    if proc.returncode != 0:
+        sys.stderr.write(
+            f"[claudes] generator exit {proc.returncode}: "
+            f"{proc.stderr.strip()[:500]}\n"
+        )
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
 def run_invocation(
     skill: str,
     skill_args: str,
@@ -389,7 +416,7 @@ def run_invocation(
 
 def run_worker(
     worker_index: int,
-    invocations: list,
+    work_queue,
     skill: str,
     worktree_base: str | None,
     result_queue: multiprocessing.Queue,
@@ -400,7 +427,12 @@ def run_worker(
     timeout: float | None,
     active_pgids=None,
 ):
-    """Run all assigned invocations sequentially in this worker."""
+    """Pull skill_args off the shared work queue until a None sentinel.
+
+    A shared queue (vs pre-sharded per-worker chunks) means a worker that
+    finishes a fast task immediately picks up the next one instead of idling
+    while a slow peer drains its own chunk.
+    """
     # Reset SIGINT to Python's default handler: the parent installs a custom
     # handler that would get inherited via fork, but workers should just raise
     # KeyboardInterrupt so the _run_in_process_group cleanup fires.
@@ -410,7 +442,10 @@ def run_worker(
     if worktree_base is not None:
         worktree_path = ensure_worktree(f"{worktree_base}-{worker_index}")
 
-    for skill_args in invocations:
+    while True:
+        skill_args = work_queue.get()
+        if skill_args is None:
+            break
         safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
         log_file = LOG_DIR / f"{safe_name}.log"
         _, rc, reason = run_invocation(
@@ -419,6 +454,63 @@ def run_worker(
             active_pgids=active_pgids,
         )
         result_queue.put((worker_index, skill_args, rc, reason))
+
+
+def run_worker_generator(
+    worker_index: int,
+    skill: str,
+    worktree_base: str | None,
+    result_queue: multiprocessing.Queue,
+    model: str | None,
+    extra_ro_binds: list[str],
+    extra_rw_binds: list[str],
+    sandbox: bool,
+    timeout: float | None,
+    generator_cmd: str,
+    inflight,
+    inflight_lock,
+    active_pgids=None,
+):
+    """Pull the next skill_args from a generator command whenever we need
+    work. Exits when the generator returns empty.
+
+    The generator is serialized across workers behind `inflight_lock` so its
+    view of what's in flight is always consistent. The lock is released
+    before running the claude invocation so other workers can pick up work
+    concurrently.
+    """
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    worktree_path: Path | None = None
+    if worktree_base is not None:
+        worktree_path = ensure_worktree(f"{worktree_base}-{worker_index}")
+
+    while True:
+        with inflight_lock:
+            lines = run_generator(generator_cmd, list(inflight))
+            if not lines:
+                break
+            skill_args = lines[0]
+            inflight.append(skill_args)
+
+        try:
+            safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
+            log_file = LOG_DIR / f"{safe_name}.log"
+            _, rc, reason = run_invocation(
+                skill, skill_args, worktree_path, log_file, model,
+                extra_ro_binds, extra_rw_binds, sandbox, timeout,
+                active_pgids=active_pgids,
+            )
+            result_queue.put((worker_index, skill_args, rc, reason))
+        finally:
+            with inflight_lock:
+                try:
+                    inflight.remove(skill_args)
+                except ValueError:
+                    pass
+
+    # Sentinel so the main loop knows this worker has drained the generator.
+    result_queue.put((worker_index, None, None, None))
 
 
 def get_worker_branches(worktree_base: str) -> list[str]:
@@ -440,6 +532,122 @@ def get_worker_branches(worktree_base: str) -> list[str]:
     return branches
 
 
+def _install_sigint_handler(active_pgids):
+    """SIGINT handler that fans SIGTERM to every tracked claude pgid. First
+    ^C raises KeyboardInterrupt for a clean stop; second ^C force-exits.
+    Returns a callable that restores the previous handler."""
+    sigint_count = [0]
+
+    def handle_sigint(signum, frame):
+        # Workers also receive this SIGINT (same foreground process group) and
+        # clean up their own claude child via the BaseException branch in
+        # _run_in_process_group. This handler is a safety net: it fans out
+        # SIGTERM to every claude pgid we know about, covering the case where
+        # a worker was between invocations (outside the try/except window).
+        sigint_count[0] += 1
+        if sigint_count[0] >= 2:
+            sys.__stderr__.write("\n[claudes] second SIGINT, force exiting\n")
+            os._exit(130)
+        sys.__stderr__.write(
+            f"\n[claudes] SIGINT received, terminating {len(active_pgids)} "
+            f"claude process group(s)...\n"
+        )
+        for pgid in list(active_pgids):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise KeyboardInterrupt
+
+    original = signal.signal(signal.SIGINT, handle_sigint)
+    return lambda: signal.signal(signal.SIGINT, original)
+
+
+def _open_main_log():
+    """Create the per-run log file and tee stdout/stderr into it.
+    Returns the file handle so callers can close it at teardown."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    main_log = LOG_DIR / f"claudes_{timestamp}.log"
+    log_fh = open(main_log, "w")
+    sys.stdout = TeeStream(sys.__stdout__, log_fh)
+    sys.stderr = TeeStream(sys.__stderr__, log_fh)
+    print(f"=== claudes run started at {now.strftime('%Y-%m-%d %H:%M:%S %Z').strip()} ===")
+    print(f"Logging to {main_log}")
+    return log_fh
+
+
+def _close_main_log(log_fh):
+    log_fh.close()
+    sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
+
+
+def cmd_skill_generator(args, worktree_base):
+    """Generator-driven mode: workers pull fresh work from `args.generator`
+    on demand instead of pre-sharding a stdin list into per-worker chunks."""
+    log_fh = _open_main_log()
+    print(f"Generator: {args.generator}")
+    print(f"Up to {args.workers} workers")
+    print(f"Skill: /{args.skill_name}")
+
+    num_workers = max(1, args.workers)
+
+    manager = multiprocessing.Manager()
+    result_queue = manager.Queue()
+    active_pgids = manager.list()
+    inflight = manager.list()
+    inflight_lock = manager.Lock()
+
+    restore_sigint = _install_sigint_handler(active_pgids)
+    completed = 0
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    run_worker_generator,
+                    idx,
+                    args.skill_name,
+                    worktree_base,
+                    result_queue,
+                    args.model,
+                    args.ro_bind,
+                    args.rw_bind,
+                    args.sandbox,
+                    args.timeout,
+                    args.generator,
+                    inflight,
+                    inflight_lock,
+                    active_pgids,
+                )
+                for idx in range(num_workers)
+            ]
+
+            print("Workers started...")
+
+            workers_done = 0
+            while workers_done < num_workers:
+                worker_index, skill_args, rc, reason = result_queue.get()
+                if skill_args is None:
+                    workers_done += 1
+                    continue
+                completed += 1
+                status = "OK" if rc == 0 else f"FAILED (rc={rc}): {reason}"
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                print(
+                    f"[{ts}] [{completed}] worker-{worker_index} {skill_args}: {status}"
+                )
+
+            for future in futures:
+                future.result()
+    finally:
+        restore_sigint()
+
+    print(f"All done. {completed} invocation(s) completed.")
+    _close_main_log(log_fh)
+
+
 def cmd_skill(args):
     """Run parallel Claude skill invocations."""
     worktree_base = None
@@ -450,6 +658,13 @@ def cmd_skill(args):
             worktree_base = subprocess.check_output(
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True
             ).strip()
+
+    if args.generator:
+        if args.debug:
+            print("--debug and --generator cannot be used together", file=sys.stderr)
+            sys.exit(2)
+        cmd_skill_generator(args, worktree_base)
+        return
 
     lines = [line.strip() for line in sys.stdin if line.strip()]
 
@@ -485,61 +700,32 @@ def cmd_skill(args):
             sys.exit(124)
         sys.exit(rc)
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    now = datetime.datetime.now()
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    main_log = LOG_DIR / f"claudes_{timestamp}.log"
-    log_fh = open(main_log, "w")
-    sys.stdout = TeeStream(sys.__stdout__, log_fh)
-    sys.stderr = TeeStream(sys.__stderr__, log_fh)
-    print(f"=== claudes run started at {now.strftime('%Y-%m-%d %H:%M:%S %Z').strip()} ===")
-    print(f"Logging to {main_log}")
+    log_fh = _open_main_log()
 
     print(f"Processing {len(lines)} invocations with up to {args.workers} workers")
     print(f"Skill: /{args.skill_name}")
 
     num_workers = min(args.workers, len(lines))
-    chunks = [[] for _ in range(num_workers)]
-    for i, line in enumerate(lines):
-        chunks[i % num_workers].append(line)
 
     manager = multiprocessing.Manager()
     result_queue = manager.Queue()
     active_pgids = manager.list()
+    work_queue = manager.Queue()
+    for line in lines:
+        work_queue.put(line)
+    # One sentinel per worker so blocked get() calls all wake cleanly once
+    # the real work is drained.
+    for _ in range(num_workers):
+        work_queue.put(None)
 
-    sigint_count = [0]
-
-    def handle_sigint(signum, frame):
-        # Workers also receive this SIGINT (same foreground process group) and
-        # clean up their own claude child via the BaseException branch in
-        # _run_in_process_group. This handler is a safety net: it fans out
-        # SIGTERM to every claude pgid we know about, covering the case where
-        # a worker was between invocations (outside the try/except window).
-        sigint_count[0] += 1
-        if sigint_count[0] >= 2:
-            sys.__stderr__.write("\n[claudes] second SIGINT, force exiting\n")
-            os._exit(130)
-        sys.__stderr__.write(
-            f"\n[claudes] SIGINT received, terminating {len(active_pgids)} "
-            f"claude process group(s)...\n"
-        )
-        for pgid in list(active_pgids):
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                pass
-        raise KeyboardInterrupt
-
-    original_sigint = signal.signal(signal.SIGINT, handle_sigint)
-
+    restore_sigint = _install_sigint_handler(active_pgids)
     try:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [
                 executor.submit(
                     run_worker,
                     idx,
-                    chunk,
+                    work_queue,
                     args.skill_name,
                     worktree_base,
                     result_queue,
@@ -550,7 +736,7 @@ def cmd_skill(args):
                     args.timeout,
                     active_pgids,
                 )
-                for idx, chunk in enumerate(chunks)
+                for idx in range(num_workers)
             ]
 
             print("Workers started...")
@@ -568,12 +754,10 @@ def cmd_skill(args):
             for future in futures:
                 future.result()
     finally:
-        signal.signal(signal.SIGINT, original_sigint)
+        restore_sigint()
 
     print("All done.")
-    log_fh.close()
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
+    _close_main_log(log_fh)
 
 
 def resolve_worktree_base(args):
@@ -741,6 +925,18 @@ def main():
         default=None,
         metavar="SECONDS",
         help="Kill each claude invocation if it doesn't finish in N seconds",
+    )
+    skill_parser.add_argument(
+        "--generator",
+        type=str,
+        default=None,
+        metavar="CMD",
+        help=(
+            "Shell command that emits the next skill_args on stdout. "
+            "Invoked whenever a worker needs work; the current in-flight "
+            "skill_args are piped on stdin. Empty output = no more work. "
+            "When set, stdin is not read and --start/--limit are ignored."
+        ),
     )
     skill_parser.add_argument(
         "skill_name",
