@@ -462,11 +462,13 @@ def cmd_skill(args):
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     main_log = LOG_DIR / f"claudes_{timestamp}.log"
     log_fh = open(main_log, "w")
     sys.stdout = TeeStream(sys.__stdout__, log_fh)
     sys.stderr = TeeStream(sys.__stderr__, log_fh)
+    print(f"=== claudes run started at {now.strftime('%Y-%m-%d %H:%M:%S %Z').strip()} ===")
     print(f"Logging to {main_log}")
 
     print(f"Processing {len(lines)} invocations with up to {args.workers} workers")
@@ -505,8 +507,9 @@ def cmd_skill(args):
             worker_index, skill_args, rc, reason = result_queue.get()
             completed += 1
             status = "OK" if rc == 0 else f"FAILED (rc={rc}): {reason}"
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
             print(
-                f"[{completed}/{len(lines)}] worker-{worker_index} {skill_args}: {status}"
+                f"[{ts}] [{completed}/{len(lines)}] worker-{worker_index} {skill_args}: {status}"
             )
 
         for future in futures:
