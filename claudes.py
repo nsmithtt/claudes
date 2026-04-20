@@ -274,18 +274,28 @@ def _run_in_process_group(
     log,
     cwd: str | None,
     timeout: float | None,
+    active_pgids=None,
 ) -> tuple[int, bool]:
     """Run `cmd` in its own process group, killing the whole group on timeout.
 
     `log` is where stdout+stderr go, and where kill-diagnostics are written.
     Pass None to inherit the parent's stdout/stderr (useful for debug mode).
     Returns (returncode, timed_out). On timeout, returncode is 124.
+
+    When `active_pgids` is a shared list, the child's pgid is registered while
+    it runs so the parent's SIGINT handler can fan out kills even if this
+    worker is stuck elsewhere when the interrupt arrives.
     """
     popen_kwargs = {"cwd": cwd, "start_new_session": True}
     if log is not None:
         popen_kwargs["stdout"] = log
         popen_kwargs["stderr"] = subprocess.STDOUT
     proc = subprocess.Popen(cmd, **popen_kwargs)
+    if active_pgids is not None:
+        try:
+            active_pgids.append(proc.pid)
+        except Exception:
+            pass
     diag = log if log is not None else sys.stderr
     try:
         rc = proc.wait(timeout=timeout)
@@ -299,6 +309,12 @@ def _run_in_process_group(
         _kill_process_group(proc.pid, diag)
         proc.wait()
         raise
+    finally:
+        if active_pgids is not None:
+            try:
+                active_pgids.remove(proc.pid)
+            except (ValueError, Exception):
+                pass
 
 
 def _log_tail(log_file: Path, n_chars: int = 4000) -> str:
@@ -325,6 +341,7 @@ def run_invocation(
     extra_rw_binds: list[str],
     sandbox: bool,
     timeout: float | None,
+    active_pgids=None,
 ):
     """Run claude on a single skill invocation, retrying on 429 rate limits."""
     cmd = build_sandboxed_command(
@@ -344,6 +361,7 @@ def run_invocation(
                 log,
                 cwd=str(worktree_path) if worktree_path is not None else None,
                 timeout=timeout,
+                active_pgids=active_pgids,
             )
             if timed_out:
                 log.write(f"\n--- timed out after {timeout}s ---\n")
@@ -380,8 +398,14 @@ def run_worker(
     extra_rw_binds: list[str],
     sandbox: bool,
     timeout: float | None,
+    active_pgids=None,
 ):
     """Run all assigned invocations sequentially in this worker."""
+    # Reset SIGINT to Python's default handler: the parent installs a custom
+    # handler that would get inherited via fork, but workers should just raise
+    # KeyboardInterrupt so the _run_in_process_group cleanup fires.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
     worktree_path: Path | None = None
     if worktree_base is not None:
         worktree_path = ensure_worktree(f"{worktree_base}-{worker_index}")
@@ -392,6 +416,7 @@ def run_worker(
         _, rc, reason = run_invocation(
             skill, skill_args, worktree_path, log_file, model,
             extra_ro_binds, extra_rw_binds, sandbox, timeout,
+            active_pgids=active_pgids,
         )
         result_queue.put((worker_index, skill_args, rc, reason))
 
@@ -481,39 +506,69 @@ def cmd_skill(args):
 
     manager = multiprocessing.Manager()
     result_queue = manager.Queue()
+    active_pgids = manager.list()
 
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [
-            executor.submit(
-                run_worker,
-                idx,
-                chunk,
-                args.skill_name,
-                worktree_base,
-                result_queue,
-                args.model,
-                args.ro_bind,
-                args.rw_bind,
-                args.sandbox,
-                args.timeout,
-            )
-            for idx, chunk in enumerate(chunks)
-        ]
+    sigint_count = [0]
 
-        print("Workers started...")
+    def handle_sigint(signum, frame):
+        # Workers also receive this SIGINT (same foreground process group) and
+        # clean up their own claude child via the BaseException branch in
+        # _run_in_process_group. This handler is a safety net: it fans out
+        # SIGTERM to every claude pgid we know about, covering the case where
+        # a worker was between invocations (outside the try/except window).
+        sigint_count[0] += 1
+        if sigint_count[0] >= 2:
+            sys.__stderr__.write("\n[claudes] second SIGINT, force exiting\n")
+            os._exit(130)
+        sys.__stderr__.write(
+            f"\n[claudes] SIGINT received, terminating {len(active_pgids)} "
+            f"claude process group(s)...\n"
+        )
+        for pgid in list(active_pgids):
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        raise KeyboardInterrupt
 
-        completed = 0
-        while completed < len(lines):
-            worker_index, skill_args, rc, reason = result_queue.get()
-            completed += 1
-            status = "OK" if rc == 0 else f"FAILED (rc={rc}): {reason}"
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            print(
-                f"[{ts}] [{completed}/{len(lines)}] worker-{worker_index} {skill_args}: {status}"
-            )
+    original_sigint = signal.signal(signal.SIGINT, handle_sigint)
 
-        for future in futures:
-            future.result()
+    try:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [
+                executor.submit(
+                    run_worker,
+                    idx,
+                    chunk,
+                    args.skill_name,
+                    worktree_base,
+                    result_queue,
+                    args.model,
+                    args.ro_bind,
+                    args.rw_bind,
+                    args.sandbox,
+                    args.timeout,
+                    active_pgids,
+                )
+                for idx, chunk in enumerate(chunks)
+            ]
+
+            print("Workers started...")
+
+            completed = 0
+            while completed < len(lines):
+                worker_index, skill_args, rc, reason = result_queue.get()
+                completed += 1
+                status = "OK" if rc == 0 else f"FAILED (rc={rc}): {reason}"
+                ts = datetime.datetime.now().strftime("%H:%M:%S")
+                print(
+                    f"[{ts}] [{completed}/{len(lines)}] worker-{worker_index} {skill_args}: {status}"
+                )
+
+            for future in futures:
+                future.result()
+    finally:
+        signal.signal(signal.SIGINT, original_sigint)
 
     print("All done.")
     log_fh.close()
