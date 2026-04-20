@@ -266,6 +266,7 @@ def run_invocation(
     extra_ro_binds: list[str],
     extra_rw_binds: list[str],
     sandbox: bool,
+    timeout: float | None,
 ):
     """Run claude on a single skill invocation, retrying on 429 rate limits."""
     cmd = build_sandboxed_command(
@@ -280,12 +281,18 @@ def run_invocation(
             if attempt > 0:
                 log.write(f"\n--- retry attempt {attempt} after 429 ---\n")
                 log.flush()
-            result = subprocess.run(
-                cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=str(worktree_path) if worktree_path is not None else None,
-            )
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    cwd=str(worktree_path) if worktree_path is not None else None,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                log.write(f"\n--- timed out after {timeout}s ---\n")
+                log.flush()
+                return skill_args, 124, f"timed out after {timeout}s"
 
         if result.returncode == 0:
             return skill_args, 0, ""
@@ -316,6 +323,7 @@ def run_worker(
     extra_ro_binds: list[str],
     extra_rw_binds: list[str],
     sandbox: bool,
+    timeout: float | None,
 ):
     """Run all assigned invocations sequentially in this worker."""
     worktree_path: Path | None = None
@@ -327,7 +335,7 @@ def run_worker(
         log_file = LOG_DIR / f"{safe_name}.log"
         _, rc, reason = run_invocation(
             skill, skill_args, worktree_path, log_file, model,
-            extra_ro_binds, extra_rw_binds, sandbox,
+            extra_ro_binds, extra_rw_binds, sandbox, timeout,
         )
         result_queue.put((worker_index, skill_args, rc, reason))
 
@@ -385,10 +393,15 @@ def cmd_skill(args):
         print("Debug mode: running 1 invocation inline")
         print(f"Skill: /{args.skill_name} {skill_args}")
         print(f"Command: {' '.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            cwd=str(worktree_path) if worktree_path is not None else None,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(worktree_path) if worktree_path is not None else None,
+                timeout=args.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"Timed out after {args.timeout}s")
+            sys.exit(124)
         sys.exit(result.returncode)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -424,6 +437,7 @@ def cmd_skill(args):
                 args.ro_bind,
                 args.rw_bind,
                 args.sandbox,
+                args.timeout,
             )
             for idx, chunk in enumerate(chunks)
         ]
@@ -606,6 +620,13 @@ def main():
         default=[],
         metavar="PATH",
         help="Additional host path to expose writable inside the sandbox (may repeat, requires --sandbox)",
+    )
+    skill_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="Kill each claude invocation if it doesn't finish in N seconds",
     )
     skill_parser.add_argument(
         "skill_name",
