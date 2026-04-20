@@ -21,6 +21,7 @@ import multiprocessing
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -243,6 +244,63 @@ def build_sandboxed_command(
     return build_bwrap_command(workspace, extra_ro, extra_rw_binds) + cmd
 
 
+def _kill_process_group(pgid: int, log) -> None:
+    """SIGTERM the whole group, then SIGKILL any stragglers after 5s.
+
+    Without this, `claude`'s children (Bash tools, MCP servers, sub-agents)
+    survive as orphans when we time out or get interrupted.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+        log.write("\n--- process group did not exit on SIGTERM, sent SIGKILL ---\n")
+        log.flush()
+    except ProcessLookupError:
+        pass
+
+
+def _run_in_process_group(
+    cmd: list[str],
+    log,
+    cwd: str | None,
+    timeout: float | None,
+) -> tuple[int, bool]:
+    """Run `cmd` in its own process group, killing the whole group on timeout.
+
+    `log` is where stdout+stderr go, and where kill-diagnostics are written.
+    Pass None to inherit the parent's stdout/stderr (useful for debug mode).
+    Returns (returncode, timed_out). On timeout, returncode is 124.
+    """
+    popen_kwargs = {"cwd": cwd, "start_new_session": True}
+    if log is not None:
+        popen_kwargs["stdout"] = log
+        popen_kwargs["stderr"] = subprocess.STDOUT
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    diag = log if log is not None else sys.stderr
+    try:
+        rc = proc.wait(timeout=timeout)
+        return rc, False
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc.pid, diag)
+        proc.wait()
+        return 124, True
+    except BaseException:
+        # KeyboardInterrupt / worker teardown: don't leak the tree.
+        _kill_process_group(proc.pid, diag)
+        proc.wait()
+        raise
+
+
 def _log_tail(log_file: Path, n_chars: int = 4000) -> str:
     try:
         return log_file.read_text()[-n_chars:]
@@ -281,20 +339,18 @@ def run_invocation(
             if attempt > 0:
                 log.write(f"\n--- retry attempt {attempt} after 429 ---\n")
                 log.flush()
-            try:
-                result = subprocess.run(
-                    cmd,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    cwd=str(worktree_path) if worktree_path is not None else None,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired:
+            rc, timed_out = _run_in_process_group(
+                cmd,
+                log,
+                cwd=str(worktree_path) if worktree_path is not None else None,
+                timeout=timeout,
+            )
+            if timed_out:
                 log.write(f"\n--- timed out after {timeout}s ---\n")
                 log.flush()
                 return skill_args, 124, f"timed out after {timeout}s"
 
-        if result.returncode == 0:
+        if rc == 0:
             return skill_args, 0, ""
 
         tail = _log_tail(log_file)
@@ -310,7 +366,7 @@ def run_invocation(
             continue
 
         last_line = tail.strip().rsplit("\n", 1)[-1] if tail.strip() else "could not read log"
-        return skill_args, result.returncode, last_line[:200]
+        return skill_args, rc, last_line[:200]
 
 
 def run_worker(
@@ -393,16 +449,16 @@ def cmd_skill(args):
         print("Debug mode: running 1 invocation inline")
         print(f"Skill: /{args.skill_name} {skill_args}")
         print(f"Command: {' '.join(cmd)}")
-        try:
-            result = subprocess.run(
-                cmd,
-                cwd=str(worktree_path) if worktree_path is not None else None,
-                timeout=args.timeout,
-            )
-        except subprocess.TimeoutExpired:
+        rc, timed_out = _run_in_process_group(
+            cmd,
+            log=None,
+            cwd=str(worktree_path) if worktree_path is not None else None,
+            timeout=args.timeout,
+        )
+        if timed_out:
             print(f"Timed out after {args.timeout}s")
             sys.exit(124)
-        sys.exit(result.returncode)
+        sys.exit(rc)
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
