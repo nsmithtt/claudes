@@ -522,7 +522,7 @@ def get_worker_branches(worktree_base: str) -> list[str]:
     )
     branches = []
     for line in result.stdout.strip().splitlines():
-        branch = line.strip().lstrip("* ")
+        branch = line.strip().lstrip("* ").lstrip("+ ").lstrip("  ")
         if branch:
             branches.append(branch)
     # Sort numerically by worker index suffix
@@ -782,8 +782,22 @@ def cmd_merge(args):
     ).strip()
     print(f"Merging {len(branches)} worker branches into {current_branch}")
 
-    for branch in branches:
-        subprocess.run(["git", "checkout", branch], capture_output=True)
+    worktree_paths = list_worktrees()
+
+    for branch in branches[args.start:]:
+        # If the branch is checked out in a worktree, rebase inside that
+        # worktree — `git checkout` from the main repo would fail with
+        # "already checked out at ...".
+        worktree_cwd = str(worktree_paths[branch]) if branch in worktree_paths else None
+        if worktree_cwd is None:
+            result = subprocess.run(["git", "checkout", branch], capture_output=True)
+            if result.returncode != 0:
+                print(f"Checkout failed for {branch}:\n{result.stderr}", file=sys.stderr)
+                sys.exit(1)
+
+        if args.force:
+            subprocess.run(["git", "reset", "--hard", "HEAD"], capture_output=True, text=True, cwd=worktree_cwd)
+            subprocess.run(["git", "clean", "-dxf"], capture_output=True, text=True, cwd=worktree_cwd)
         print(f"\n--- Rebasing {branch} onto {current_branch} (strategy: theirs) ---")
         result = subprocess.run(
             [
@@ -797,14 +811,16 @@ def cmd_merge(args):
             ],
             capture_output=True,
             text=True,
+            cwd=worktree_cwd,
         )
         if result.returncode != 0:
             print(f"Rebase failed for {branch}:\n{result.stderr}", file=sys.stderr)
-            subprocess.run(["git", "rebase", "--abort"])
+            subprocess.run(["git", "rebase", "--abort"], cwd=worktree_cwd)
             sys.exit(1)
 
         print(f"--- Merging {branch} into {current_branch} ---")
-        subprocess.run(["git", "checkout", current_branch], capture_output=True)
+        if worktree_cwd is None:
+            subprocess.run(["git", "checkout", current_branch], capture_output=True)
         result = subprocess.run(
             ["git", "merge", branch],
             capture_output=True,
@@ -954,6 +970,17 @@ def main():
         nargs="?",
         default="",
         help="Worktree base name (default: current branch). Branches named <base>-0, <base>-1, ... will be merged.",
+    )
+    merge_parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Git reset & clean uncommitted changes",
+    )
+    merge_parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Git branch index to start with",
     )
 
     # clean subcommand
