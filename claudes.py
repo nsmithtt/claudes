@@ -584,6 +584,19 @@ def _close_main_log(log_fh):
     sys.stderr = sys.__stderr__
 
 
+def _read_stdin_lines(start: int, limit: int) -> list[str]:
+    """Read non-blank lines from stdin, apply --start/--limit, exit if empty."""
+    lines = [line.strip() for line in sys.stdin if line.strip()]
+    if start > 0:
+        lines = lines[start:]
+    if limit > 0:
+        lines = lines[:limit]
+    if not lines:
+        print("No input lines to process.", file=sys.stderr)
+        sys.exit(1)
+    return lines
+
+
 def cmd_skill_generator(args, worktree_base):
     """Generator-driven mode: workers pull fresh work from `args.generator`
     on demand instead of pre-sharding a stdin list into per-worker chunks."""
@@ -666,19 +679,12 @@ def cmd_skill(args):
         cmd_skill_generator(args, worktree_base)
         return
 
-    lines = [line.strip() for line in sys.stdin if line.strip()]
-
-    if args.start > 0:
-        lines = lines[args.start :]
-    if args.limit > 0:
-        lines = lines[: args.limit]
-
-    if not lines:
-        print("No input lines to process.", file=sys.stderr)
-        sys.exit(1)
-
     if args.debug:
-        skill_args = lines[0]
+        if isinstance(args.debug, str):
+            skill_args = args.debug
+        else:
+            skill_args = _read_stdin_lines(args.start, args.limit)[0]
+
         worktree_path: Path | None = None
         if worktree_base is not None:
             worktree_path = ensure_worktree(f"{worktree_base}-debug")
@@ -699,6 +705,8 @@ def cmd_skill(args):
             print(f"Timed out after {args.timeout}s")
             sys.exit(124)
         sys.exit(rc)
+
+    lines = _read_stdin_lines(args.start, args.limit)
 
     log_fh = _open_main_log()
 
@@ -913,8 +921,17 @@ def main():
     )
     skill_parser.add_argument(
         "--debug",
-        action="store_true",
-        help="Debug mode: take 1 input, run claude directly in this process (no worker pool)",
+        nargs="?",
+        const=True,
+        default=False,
+        metavar="INPUT",
+        help=(
+            "Debug mode: run 1 invocation of claude directly in this process "
+            "(no worker pool). Without an argument, takes the first line from "
+            "stdin. With an argument, uses that as the input line and ignores "
+            "stdin. Use --debug=INPUT to disambiguate from the skill_name "
+            "positional."
+        ),
     )
     skill_parser.add_argument(
         "--sandbox",
