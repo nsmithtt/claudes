@@ -445,6 +445,7 @@ def run_worker(
     while True:
         skill_args = work_queue.get()
         if skill_args is None:
+            print(f"worker-{worker_index} received done signal, exiting")
             break
         safe_name = skill_args.replace("/", "_").replace(" ", "_")[:80]
         log_file = LOG_DIR / f"{safe_name}.log"
